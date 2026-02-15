@@ -37,8 +37,9 @@ fi
 
 # Install tele-gent
 echo "Installing tele-gent..."
-pipx install . --force
-pipx ensurepath 2>/dev/null || true
+pipx install . --force --quiet
+pipx ensurepath --quiet 2>/dev/null || true
+echo "  Installed tele-gent command."
 echo
 
 # Copy hook script
@@ -98,8 +99,11 @@ echo
 if [ -f "$ENV_FILE" ]; then
     echo "Found existing .env file. Skipping."
 else
-    read -p "Telegram bot token (from @BotFather): " BOT_TOKEN
-    read -p "Your Telegram user ID (from @userinfobot): " USER_ID
+    echo "---"
+    echo "Enter your Telegram credentials:"
+    echo
+    read -p "Bot token (from @BotFather): " BOT_TOKEN
+    read -p "User ID (from @userinfobot): " USER_ID
 
     cat > "$ENV_FILE" <<EOF
 BOT_TOKEN=$BOT_TOKEN
@@ -111,5 +115,5 @@ fi
 echo
 echo "=== Setup complete ==="
 echo
-echo "Run the bot with:"
-echo "  source .env && tele-gent"
+echo "Open a new terminal, then run:"
+echo "  cd $(pwd) && tele-gent"

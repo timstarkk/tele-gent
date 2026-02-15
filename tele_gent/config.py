@@ -1,6 +1,16 @@
 import os
 import sys
 
+# Load .env from current directory if it exists
+_env_path = os.path.join(os.getcwd(), ".env")
+if os.path.isfile(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _key, _, _val = _line.partition("=")
+                os.environ.setdefault(_key.strip(), _val.strip())
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 AUTHORIZED_USER_ID = os.environ.get("AUTHORIZED_USER_ID")
 
