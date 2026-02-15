@@ -2,8 +2,6 @@
   <img src="logo.png" alt="tele-gent" width="300">
 </p>
 
-# tele-gent
-
 tele-gent: Telegram + AI agent. Remote terminal and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) on your machine — from your phone.
 
 ## Features
