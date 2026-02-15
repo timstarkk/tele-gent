@@ -8,7 +8,7 @@ import struct
 import termios
 import time
 
-from config import PTY_COLS, PTY_ROWS, TERM
+from tele_gent.config import PTY_COLS, PTY_ROWS, TERM
 
 # ANSI stripping: replace cursor-forward with spaces, strip everything else
 _CURSOR_FORWARD_RE = re.compile(r'\x1b\[(\d*)C')

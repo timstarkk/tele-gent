@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tele-gent"
+version = "0.1.0"
+description = "Telegram bot for terminal & Claude Code access"
+requires-python = ">=3.10"
+dependencies = [
+    "python-telegram-bot>=22.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["tele_gent*"]
+
+[project.scripts]
+tele-gent = "tele_gent.bot:main"

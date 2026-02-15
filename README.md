@@ -39,7 +39,24 @@ npm install -g @anthropic-ai/claude-code
 
 Then run `claude` once to authenticate with your Anthropic API key. The bot calls `claude` directly, so it needs to be on your PATH and already logged in.
 
-### 4. Clone and run setup
+### 4. Install pipx
+
+[pipx](https://pipx.pypa.io/) installs Python CLI tools in isolated environments.
+
+```bash
+# macOS
+brew install pipx
+
+# Ubuntu/Debian
+sudo apt install pipx
+
+# Fedora
+sudo dnf install pipx
+```
+
+Then run `pipx ensurepath` and open a new terminal.
+
+### 5. Clone and run setup
 
 ```bash
 git clone https://github.com/timstarkk/tele-gent.git
@@ -50,17 +67,17 @@ cd tele-gent
 Requires Python 3.10+ on macOS or Linux. Windows is not supported (the bot uses Unix PTY for terminal sessions).
 
 The setup script will:
-- Install Python dependencies
+- Install tele-gent as a CLI command via pipx
 - Copy the permission hook into `~/.claude/hooks/`
 - Add the `PreToolUse` hook to `~/.claude/settings.json` (without overwriting your existing config)
 - Prompt for your bot token and user ID, save them to `.env`
 
 > The hook only activates when Claude is launched by the bot (via the `TELEBOT_SESSION_ID` env var). It won't interfere with normal interactive Claude usage.
 
-### 5. Run
+### 6. Run
 
 ```bash
-source .env && python bot.py
+source .env && tele-gent
 ```
 
 You'll get a "Terminal bot started" message in Telegram when it's ready.

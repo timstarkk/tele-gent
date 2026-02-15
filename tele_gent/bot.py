@@ -17,7 +17,7 @@ from telegram.ext import (
     filters,
 )
 
-from config import (
+from tele_gent.config import (
     AUTHORIZED_USER_ID,
     BOT_TOKEN,
     PERM_REQ_PATTERN,
@@ -25,8 +25,8 @@ from config import (
     START_DIR,
     TELEGRAM_MAX_LENGTH,
 )
-from claude_runner import ClaudeRunner
-from pty_manager import PTYSession
+from tele_gent.claude_runner import ClaudeRunner
+from tele_gent.pty_manager import PTYSession
 
 IMAGES_DIR = os.path.expanduser("~/.claude/images")
 os.makedirs(IMAGES_DIR, exist_ok=True)

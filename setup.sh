@@ -10,9 +10,15 @@ ENV_FILE=".env"
 echo "=== tele-gent setup ==="
 echo
 
-# Check Python
+# Check prerequisites
 if ! command -v python3 &>/dev/null; then
     echo "Error: python3 not found. Install Python 3.10+ first."
+    exit 1
+fi
+
+if ! command -v pipx &>/dev/null; then
+    echo "Error: pipx not found."
+    echo "Install it with: brew install pipx (macOS) or sudo apt install pipx (Linux)"
     exit 1
 fi
 
@@ -29,9 +35,10 @@ if [ ! -d "$CLAUDE_DIR" ]; then
     exit 1
 fi
 
-# Install Python dependencies
-echo "Installing Python dependencies..."
-pip install -r requirements.txt
+# Install tele-gent
+echo "Installing tele-gent..."
+pipx install . --force
+pipx ensurepath 2>/dev/null || true
 echo
 
 # Copy hook script
@@ -105,4 +112,4 @@ echo
 echo "=== Setup complete ==="
 echo
 echo "Run the bot with:"
-echo "  source .env && python bot.py"
+echo "  source .env && tele-gent"

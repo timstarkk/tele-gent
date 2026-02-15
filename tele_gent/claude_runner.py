@@ -2,7 +2,7 @@ import asyncio
 import os
 import signal
 
-from config import (
+from tele_gent.config import (
     CLAUDE_BIN,
     CLAUDE_FLUSH_INTERVAL,
     PERM_REQ_PATTERN,
