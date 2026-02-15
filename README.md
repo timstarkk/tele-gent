@@ -17,6 +17,14 @@ Three Claude permission modes:
 - `auto` — runs without permission checks
 - `plan` — enables planning mode
 
+## Screenshots
+
+<p align="center">
+  <img src="screenshots/1.jpg" alt="Starting the bot" width="250">
+  <img src="screenshots/2.jpg" alt="Terminal and Claude mode" width="250">
+  <img src="screenshots/3.jpg" alt="Claude answering a prompt" width="250">
+</p>
+
 ## Setup
 
 ### 1. Create a Telegram bot
@@ -77,7 +85,8 @@ The setup script will:
 ### 6. Run
 
 ```bash
-source .env && tele-gent
+cd tele-gent
+tele-gent
 ```
 
 You'll get a "Terminal bot started" message in Telegram when it's ready.
