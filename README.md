@@ -6,9 +6,9 @@ tele-gent: Telegram + AI agent. Remote terminal and [Claude Code](https://docs.a
 
 ## Features
 
-**Terminal mode** — a full shell session over Telegram. Send commands, get output, send control signals (`^C`, `^D`, `^Z`). Upload images with captions to pass files into your session.
+**Terminal mode** — a full shell session over Telegram, backed by [tmux](https://github.com/tmux/tmux). Send commands, get output, send control signals (`^C`, `^D`, `^Z`). Upload images with captions to pass files into your session. Attach locally with `tmux attach -t tele-gent` to share the same session from your laptop.
 
-**Claude mode** — type `claude <prompt>` to start a Claude Code session. It runs in your terminal's working directory with full tool access. Permission requests show up in the chat for you to approve or deny.
+**Claude mode** — type `claude <prompt>` to start a Claude Code session. It runs in your terminal's working directory with full tool access. Permission prompts appear in both the terminal and Telegram — approve or deny from whichever is closer.
 
 Three Claude permission modes:
 - `normal` — asks before each tool use
@@ -35,7 +35,19 @@ Three Claude permission modes:
 
 Message [@userinfobot](https://t.me/userinfobot) on Telegram — it'll reply with your numeric user ID. This locks the bot so only you can use it.
 
-### 3. Install Claude Code
+### 3. Install tmux
+
+Terminal sessions run inside [tmux](https://github.com/tmux/tmux), which lets you attach locally to the same session the bot controls.
+
+```bash
+# macOS
+brew install tmux
+
+# Ubuntu/Debian
+sudo apt install tmux
+```
+
+### 4. Install Claude Code
 
 tele-gent uses the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) under the hood. Install it with npm:
 
@@ -45,7 +57,7 @@ npm install -g @anthropic-ai/claude-code
 
 Then run `claude` once to authenticate with your Anthropic API key. The bot calls `claude` directly, so it needs to be on your PATH and already logged in.
 
-### 4. Install pipx
+### 5. Install pipx
 
 [pipx](https://pipx.pypa.io/) installs Python CLI tools in isolated environments.
 
@@ -62,7 +74,7 @@ sudo dnf install pipx
 
 Then run `pipx ensurepath` and open a new terminal.
 
-### 5. Clone and run setup
+### 6. Clone and run setup
 
 ```bash
 git clone https://github.com/timstarkk/tele-gent.git
@@ -70,7 +82,7 @@ cd tele-gent
 ./setup.sh
 ```
 
-Requires Python 3.10+ on macOS or Linux. Windows is not supported (the bot uses Unix PTY for terminal sessions).
+Requires Python 3.10+, tmux, and macOS or Linux.
 
 The setup script will:
 - Install tele-gent as a CLI command via pipx
@@ -78,9 +90,9 @@ The setup script will:
 - Add the `PreToolUse` hook to `~/.claude/settings.json` (without overwriting your existing config)
 - Prompt for your bot token and user ID, save them to `.env`
 
-> The hook only activates when Claude is launched by the bot (via the `TELEBOT_SESSION_ID` env var). It won't interfere with normal interactive Claude usage.
+> The hook only activates when Claude is launched by the bot (via the `TELEBOT_SESSION_ID` env var). It won't interfere with normal interactive Claude usage. When active, it notifies the bot of permission requests and tells Claude to show its native terminal prompt, so you can approve from either Telegram or the terminal.
 
-### 6. Run
+### 7. Run
 
 ```bash
 cd tele-gent
@@ -120,7 +132,9 @@ Send a photo with a caption to save the image and pass the path + caption to you
 
 Type `claude` to enter Claude mode, or `claude <prompt>` to jump straight in. Follow-up messages continue the conversation. Send `^C` to cancel a running request, or `/terminal` to switch back.
 
-When in `normal` mode, Claude will ask permission before running tools — reply `y` or `n`.
+When in `normal` mode, Claude will ask permission before running tools. You can approve from either place:
+- **Telegram** — reply `y` or `n`
+- **Terminal** — use the native Claude permission prompt (`tmux attach -t tele-gent`)
 
 ## Security
 
