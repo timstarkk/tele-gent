@@ -6,7 +6,6 @@ from tele_gent.config import (
     CLAUDE_BIN,
     CLAUDE_FLUSH_INTERVAL,
     PERM_REQ_PATTERN,
-    PERM_RESP_PATTERN,
 )
 
 
@@ -144,7 +143,7 @@ class ClaudeRunner:
 
     def _cleanup_perm_files(self):
         """Remove any lingering permission request/response temp files."""
-        for pattern in (PERM_REQ_PATTERN, PERM_RESP_PATTERN):
+        for pattern in (PERM_REQ_PATTERN,):
             path = pattern.format(session_id=self.session_id)
             try:
                 os.remove(path)

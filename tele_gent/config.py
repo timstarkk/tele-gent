@@ -38,8 +38,10 @@ CLAUDE_BIN = "claude"
 CLAUDE_FLUSH_INTERVAL = 2.0
 TMPDIR = os.environ.get("TMPDIR", "/tmp")
 PERM_REQ_PATTERN = os.path.join(TMPDIR, "telebot_perm_req_{session_id}.json")
-PERM_RESP_PATTERN = os.path.join(TMPDIR, "telebot_perm_resp_{session_id}.json")
-PERM_TIMEOUT = 120
+
+# tmux settings
+TMUX_SESSION_NAME = "tele-gent"
+TMUX_PIPE_FILE = os.path.join(os.environ.get("TMPDIR", "/tmp"), "tele-gent-pipe.log")
 
 # Initial working directory (where the user launched the bot from)
 START_DIR = os.environ.get("TELEBOT_START_DIR", os.path.expanduser("~"))
