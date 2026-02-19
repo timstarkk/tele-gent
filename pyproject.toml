@@ -9,6 +9,7 @@ description = "Telegram bot for terminal & Claude Code access"
 requires-python = ">=3.10"
 dependencies = [
     "python-telegram-bot>=22.0",
+    "faster-whisper>=1.0.0",
 ]
 
 [tool.setuptools.packages.find]

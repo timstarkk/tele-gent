@@ -98,6 +98,10 @@ class PTYSession:
                 "tmux is not installed. Install it with: brew install tmux"
             )
 
+        # Enable mouse scrolling and increase scrollback buffer
+        _tmux("set-option", "-t", TMUX_SESSION_NAME, "mouse", "on", check=False)
+        _tmux("set-option", "-t", TMUX_SESSION_NAME, "history-limit", "50000", check=False)
+
         # Pipe pane output to file
         _tmux(
             "pipe-pane", "-t", TMUX_SESSION_NAME,

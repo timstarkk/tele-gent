@@ -1,4 +1,5 @@
 import asyncio
+import glob as globmod
 import json
 import logging
 import os
@@ -31,6 +32,20 @@ from tele_gent.pty_manager import PTYSession, _tmux
 IMAGES_DIR = os.path.expanduser("~/.claude/images")
 os.makedirs(IMAGES_DIR, exist_ok=True)
 
+VOICE_DIR = os.path.expanduser("~/.claude/voice")
+os.makedirs(VOICE_DIR, exist_ok=True)
+
+# Lazy-loaded whisper model (initialized on first voice message)
+_whisper_model = None
+
+
+def _get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+    return _whisper_model
+
 # --- Zero logging: suppress all loggers ---
 logging.disable(logging.CRITICAL)
 # Extra safety: suppress httpx token leaking
@@ -52,6 +67,10 @@ _perm_set_at = 0.0
 _claude_watch_task = None
 _last_response_uuid = None
 _last_jsonl_path = None
+
+# Resume flow state
+_resume_pending = False
+_resume_sessions = []  # list of session IDs (jsonl stems)
 
 # Claude JSONL conversation directory
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
@@ -263,6 +282,73 @@ def _snapshot_last_response_uuid():
     else:
         _last_response_uuid = None
         _last_jsonl_path = None
+
+
+# --- Recent sessions listing for /resume ---
+def _list_recent_sessions(n=5):
+    """Return list of (session_id, preview, mtime) for the n most recent sessions.
+
+    session_id is the JSONL filename stem (UUID), preview is the first user
+    message truncated to 60 chars, mtime is the file modification time.
+    """
+    cwd = _get_pty_cwd()
+    project_slug = cwd.replace("/", "-")
+    project_dir = os.path.join(CLAUDE_PROJECTS_DIR, project_slug)
+    if not os.path.isdir(project_dir):
+        return []
+    jsonls = globmod.glob(os.path.join(project_dir, "*.jsonl"))
+    if not jsonls:
+        return []
+    # Sort by mtime descending
+    jsonls.sort(key=os.path.getmtime, reverse=True)
+    results = []
+    for path in jsonls[:n]:
+        session_id = os.path.splitext(os.path.basename(path))[0]
+        mtime = os.path.getmtime(path)
+        preview = ""
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if msg.get("type") == "user":
+                        inner = msg.get("message", {})
+                        for block in inner.get("content", []):
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                preview = block.get("text", "").strip()
+                                break
+                            elif isinstance(block, str):
+                                preview = block.strip()
+                                break
+                        if preview:
+                            break
+        except (IOError, OSError):
+            pass
+        if len(preview) > 60:
+            preview = preview[:57] + "..."
+        results.append((session_id, preview or "(no preview)", mtime))
+    return results
+
+
+def _format_time_ago(mtime):
+    """Format mtime as a human-readable 'X ago' string."""
+    delta = time.time() - mtime
+    if delta < 60:
+        return "just now"
+    elif delta < 3600:
+        mins = int(delta // 60)
+        return f"{mins} min ago"
+    elif delta < 86400:
+        hrs = int(delta // 3600)
+        return f"{hrs} hr{'s' if hrs > 1 else ''} ago"
+    else:
+        days = int(delta // 86400)
+        return f"{days} day{'s' if days > 1 else ''} ago"
 
 
 # --- Send Claude response (markdown, not code block) ---
@@ -541,6 +627,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status — session info\n"
         "/terminal — exit Claude mode, back to terminal\n"
         "/claude_new — reset Claude conversation\n"
+        "/resume — resume a recent Claude session\n"
         "/mode — show/set Claude permission mode (normal/auto/plan)\n"
         "/ctrl_c — send Ctrl+C\n"
         "/ctrl_d — send Ctrl+D\n"
@@ -624,15 +711,80 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Claude permission mode set to: {_claude_perm_mode}")
 
 
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List recent Claude sessions for resuming."""
+    if not authorized(update):
+        return
+    global _chat_id, _resume_pending, _resume_sessions
+    _chat_id = update.effective_chat.id
+
+    # Auto-start session if none exists (need cwd for project dir lookup)
+    if session is None or not session.alive:
+        start_session()
+        await setup_reader()
+
+    sessions = _list_recent_sessions(5)
+    if not sessions:
+        await update.message.reply_text("No recent sessions found.")
+        return
+
+    lines = ["Recent sessions:"]
+    _resume_sessions = []
+    for i, (sid, preview, mtime) in enumerate(sessions, 1):
+        ago = _format_time_ago(mtime)
+        lines.append(f"{i}. {preview} ({ago})")
+        _resume_sessions.append(sid)
+    lines.append("\nReply with a number to resume.")
+    _resume_pending = True
+    await update.message.reply_text("\n".join(lines))
+
+
 # --- Text message handler ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
 
-    global _chat_id, _claude_mode, _perm_pending
+    global _chat_id, _claude_mode, _perm_pending, _resume_pending, _resume_sessions
     _chat_id = update.effective_chat.id
 
     text = update.message.text
+
+    # --- Resume selection handling ---
+    if _resume_pending and text.strip().isdigit():
+        idx = int(text.strip())
+        if 1 <= idx <= len(_resume_sessions):
+            session_id = _resume_sessions[idx - 1]
+            _resume_pending = False
+            _resume_sessions = []
+            # Auto-start terminal session if needed
+            if session is None or not session.alive:
+                start_session()
+                await setup_reader()
+            # Exit current Claude if running
+            if _claude_mode:
+                await _exit_claude()
+                await asyncio.sleep(1.0)
+            # Enter Claude mode with --resume
+            _claude_mode = True
+            _perm_pending = False
+            session.suppress_output = True
+            _snapshot_last_response_uuid()
+            _start_claude_watcher()
+            cmd = _build_claude_start_cmd() + f" --resume {session_id}"
+            session.send_line(cmd)
+            asyncio.ensure_future(_dismiss_trust_prompt())
+            await update.message.reply_text(f"Resuming session {idx}...")
+            return
+        else:
+            _resume_pending = False
+            _resume_sessions = []
+            await update.message.reply_text("Invalid selection. Resume cancelled.")
+            return
+
+    # Clear resume pending if user sends something else
+    if _resume_pending:
+        _resume_pending = False
+        _resume_sessions = []
 
     # --- Claude trigger: "claude" or "claude <prompt>" ---
     if text == "claude" or text.startswith("claude "):
@@ -760,6 +912,49 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Saved: {filepath}")
 
 
+# --- Voice handler ---
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+
+    global _chat_id, _perm_pending
+    _chat_id = update.effective_chat.id
+
+    file = await context.bot.get_file(update.message.voice.file_id)
+    ts = int(time.time())
+    filepath = os.path.join(VOICE_DIR, f"voice_{ts}.ogg")
+    await file.download_to_drive(filepath)
+
+    await update.message.reply_text("Transcribing...")
+
+    model = _get_whisper_model()
+    segments, _ = model.transcribe(filepath)
+    text = " ".join(seg.text for seg in segments).strip()
+
+    if not text:
+        await update.message.reply_text("Could not transcribe audio.")
+        return
+
+    await update.message.reply_text(f"Heard: {text}")
+
+    # Auto-start session if none exists
+    if session is None or not session.alive:
+        start_session()
+        await setup_reader()
+
+    if _claude_mode:
+        _start_claude_watcher()
+        if _perm_pending:
+            await _deny_perm_and_wait()
+            if session is not None and session.alive:
+                session.send_signal_char("\x03")
+            await asyncio.sleep(0.5)
+        session.send_line(text.replace("\n", " "))
+    else:
+        # In terminal mode, just display — don't auto-execute voice as commands
+        await update.message.reply_text("(Terminal mode: transcription shown only, not executed)")
+
+
 # --- Catch-all for unrecognized /commands ---
 async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Forward unrecognized slash commands to Claude when in Claude mode."""
@@ -839,6 +1034,7 @@ def main():
     application.add_handler(CommandHandler("terminal", cmd_terminal))
     application.add_handler(CommandHandler("claude_new", cmd_claude_new))
     application.add_handler(CommandHandler("mode", cmd_mode))
+    application.add_handler(CommandHandler("resume", cmd_resume))
     # Catch-all for unrecognized /commands — must be after specific CommandHandlers
     application.add_handler(
         MessageHandler(filters.COMMAND, handle_unknown_command)
@@ -848,6 +1044,9 @@ def main():
     )
     application.add_handler(
         MessageHandler(filters.PHOTO, handle_photo)
+    )
+    application.add_handler(
+        MessageHandler(filters.VOICE, handle_voice)
     )
 
     # Run with polling (no webhooks, no open ports)
