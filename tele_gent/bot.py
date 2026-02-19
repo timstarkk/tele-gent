@@ -5,6 +5,7 @@ import logging
 import os
 import signal
 import sys
+import tempfile
 import time
 import uuid
 
@@ -22,7 +23,9 @@ from tele_gent.config import (
     BOT_TOKEN,
     CLAUDE_BIN,
     PERM_REQ_PATTERN,
+    PERM_RESP_PATTERN,
     START_DIR,
+    TELEBOT_PID_FILE,
     TELEGRAM_MAX_LENGTH,
     TMUX_PIPE_FILE,
     TMUX_SESSION_NAME,
@@ -382,12 +385,28 @@ async def send_claude_response(text: str):
                 pass
 
 
-# --- Permission deny helper ---
+# --- Permission response helpers ---
+def _write_perm_response(decision: str):
+    """Write a permission response file for the hook to pick up (atomic)."""
+    resp_path = PERM_RESP_PATTERN.format(session_id=_telebot_session_id)
+    dir_name = os.path.dirname(resp_path)
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump({"decision": decision}, f)
+        os.rename(tmp_path, resp_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 async def _deny_perm_and_wait():
-    """Send Escape to dismiss the native permission prompt."""
+    """Deny the pending permission by writing a response file."""
     global _perm_pending
-    if session is not None and session.alive:
-        _tmux("send-keys", "-t", TMUX_SESSION_NAME, "Escape", check=False)
+    _write_perm_response("deny")
     _perm_pending = False
     await asyncio.sleep(0.5)
 
@@ -456,7 +475,9 @@ async def _claude_watcher():
                         pass
 
             # --- JSONL response extraction (before exit check to avoid missing final response) ---
-            if jsonl_path:
+            # Skip while permission is pending to avoid interleaving Claude text
+            # with the permission prompt
+            if jsonl_path and not _perm_pending:
                 # New JSONL file = new Claude session; snapshot to skip
                 # any existing content (like the greeting)
                 if jsonl_path != _last_jsonl_path:
@@ -533,14 +554,41 @@ def _stop_claude_watcher():
         _claude_watch_task = None
 
 
+# --- Cleanup stale perm files from previous sessions ---
+_perm_files_cleaned = False
+
+def _cleanup_old_perm_files():
+    """Remove any leftover perm files from previous sessions."""
+    global _perm_files_cleaned
+    if _perm_files_cleaned:
+        return
+    _perm_files_cleaned = True
+    tmpdir = os.environ.get("TMPDIR", "/tmp")
+    for pattern in ("telebot_perm_req_*.json", "telebot_perm_resp_*.json"):
+        for f in globmod.glob(os.path.join(tmpdir, pattern)):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+    # Clean up stale PID file
+    try:
+        os.remove(TELEBOT_PID_FILE)
+    except OSError:
+        pass
+
+
 # --- PTY lifecycle ---
 def start_session():
     global session
+    _cleanup_old_perm_files()
     if session is not None and session.alive:
         session.stop_reading()
         session.kill()
     session = PTYSession()
-    session.spawn(cwd=START_DIR, env={"TELEBOT_SESSION_ID": _telebot_session_id})
+    session.spawn(cwd=START_DIR, env={
+        "TELEBOT_SESSION_ID": _telebot_session_id,
+        "TELEBOT_PID": str(os.getpid()),
+    })
 
 
 async def setup_reader():
@@ -552,8 +600,12 @@ async def setup_reader():
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
-    global _chat_id
+    global _chat_id, _claude_mode, _perm_pending
     _chat_id = update.effective_chat.id
+
+    _stop_claude_watcher()
+    _claude_mode = False
+    _perm_pending = False
 
     if session is not None:
         session.stop_reading()
@@ -567,6 +619,12 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_kill(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
+    global _claude_mode, _perm_pending
+
+    _stop_claude_watcher()
+    _claude_mode = False
+    _perm_pending = False
+
     if session is not None and session.alive:
         session.stop_reading()
         session.kill()
@@ -819,18 +877,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Permission response (only when a permission is pending)
-        # Allow — press Enter to accept pre-selected "Allow once"
+        # Allow — write response file for the hook
         if _perm_pending and text.lower() in ("y", "yes"):
-            if session is not None and session.alive:
-                _tmux("send-keys", "-t", TMUX_SESSION_NAME, "Enter", check=False)
+            _write_perm_response("allow")
             _perm_pending = False
             await update.message.reply_text("Allowed.")
             return
 
-        # Deny — press Escape to dismiss
+        # Deny — write response file for the hook
         if _perm_pending and text.lower() in ("n", "no"):
-            if session is not None and session.alive:
-                _tmux("send-keys", "-t", TMUX_SESSION_NAME, "Escape", check=False)
+            _write_perm_response("deny")
             _perm_pending = False
             await update.message.reply_text("Denied.")
             return
@@ -1048,6 +1104,10 @@ def main():
     application.add_handler(
         MessageHandler(filters.VOICE, handle_voice)
     )
+
+    # Write PID file so the hook can check if we're alive
+    with open(TELEBOT_PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
 
     # Run with polling (no webhooks, no open ports)
     sys.stderr.write(f"Starting bot... attach terminal: tmux attach -t {TMUX_SESSION_NAME}\n")

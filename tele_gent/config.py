@@ -38,6 +38,8 @@ CLAUDE_BIN = "claude"
 CLAUDE_FLUSH_INTERVAL = 2.0
 TMPDIR = os.environ.get("TMPDIR", "/tmp")
 PERM_REQ_PATTERN = os.path.join(TMPDIR, "telebot_perm_req_{session_id}.json")
+PERM_RESP_PATTERN = os.path.join(TMPDIR, "telebot_perm_resp_{session_id}.json")
+TELEBOT_PID_FILE = os.path.join(TMPDIR, "telebot_pid.txt")
 
 # tmux settings
 TMUX_SESSION_NAME = "tele-gent"

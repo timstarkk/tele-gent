@@ -43,9 +43,28 @@ with open(req_path, "w") as f:
     json.dump(request, f)
 _log("req written")
 
-# Poll for response (no timeout — bot always writes a response)
-_log(f"polling for resp at {resp_path}")
+# Resolve bot PID for liveness checks
+bot_pid_str = os.environ.get("TELEBOT_PID")
+bot_pid = int(bot_pid_str) if bot_pid_str else None
+# Fallback: if no PID env var, use a 120s deadline
+deadline = None if bot_pid is not None else time.time() + 120
+
+_log(f"polling for resp at {resp_path}, bot_pid={bot_pid}")
+
 while True:
+    # Check deadline fallback (only when no PID available)
+    if deadline is not None and time.time() >= deadline:
+        _log("timeout waiting for response, denying")
+        break
+
+    # Check if bot process is still alive
+    if bot_pid is not None:
+        try:
+            os.kill(bot_pid, 0)
+        except OSError:
+            _log("bot process gone, denying")
+            break
+
     if os.path.exists(resp_path):
         _log("resp file found")
         try:
@@ -53,7 +72,6 @@ while True:
                 resp = json.load(f)
         except (json.JSONDecodeError, IOError):
             _log("resp file unreadable, retrying")
-            # File being written — retry next poll
             time.sleep(0.5)
             continue
         try:
@@ -74,3 +92,16 @@ while True:
         }))
         sys.exit(0)
     time.sleep(1)
+
+# Bot died or timeout — deny by default and clean up
+try:
+    os.remove(req_path)
+except FileNotFoundError:
+    pass
+print(json.dumps({
+    "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny"
+    }
+}))
+sys.exit(0)
