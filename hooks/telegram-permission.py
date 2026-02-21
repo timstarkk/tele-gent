@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from datetime import datetime
 
 def _log(msg):
@@ -27,14 +28,16 @@ session_id = os.environ.get("TELEBOT_SESSION_ID")
 if not session_id:
     sys.exit(0)
 
-_log(f"hook started, session={session_id}")
+uid = uuid.uuid4().hex[:8]
+_log(f"hook started, session={session_id}, uid={uid}")
 
 tmpdir = os.environ.get("TMPDIR", "/tmp")
-req_path = os.path.join(tmpdir, f"telebot_perm_req_{session_id}.json")
-resp_path = os.path.join(tmpdir, f"telebot_perm_resp_{session_id}.json")
+req_path = os.path.join(tmpdir, f"telebot_perm_req_{session_id}_{uid}.json")
+resp_path = os.path.join(tmpdir, f"telebot_perm_resp_{session_id}_{uid}.json")
 
 # Write request for bot to pick up
 request = {
+    "uid": uid,
     "tool_name": input_data.get("tool_name", "unknown"),
     "tool_input": input_data.get("tool_input", {}),
     "ts": int(time.time()),

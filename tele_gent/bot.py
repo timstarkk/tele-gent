@@ -1,3 +1,4 @@
+import atexit
 import asyncio
 import glob as globmod
 import json
@@ -22,7 +23,7 @@ from tele_gent.config import (
     AUTHORIZED_USER_ID,
     BOT_TOKEN,
     CLAUDE_BIN,
-    PERM_REQ_PATTERN,
+    PERM_REQ_GLOB,
     PERM_RESP_PATTERN,
     START_DIR,
     TELEBOT_PID_FILE,
@@ -65,11 +66,11 @@ _chat_id = None
 _claude_mode = False
 _claude_perm_mode = "normal"  # "normal", "auto", or "plan"
 _telebot_session_id = uuid.uuid4().hex[:12]
-_perm_pending = False
-_perm_set_at = 0.0
+_perm_queue: list[dict] = []  # each: {"uid", "tool_name", "tool_input", "sent_at"}
 _claude_watch_task = None
 _last_response_uuid = None
 _last_jsonl_path = None
+_jsonl_locked = False
 _claude_cwd = None  # Pinned CWD at claude-mode entry (before Claude chdir's)
 
 # Resume flow state
@@ -276,7 +277,8 @@ def _extract_last_response(jsonl_path: str, after_uuid: str | None,
 
 def _snapshot_last_response_uuid():
     """Snapshot the current last response UUID so we only send NEW responses."""
-    global _last_response_uuid, _last_jsonl_path
+    global _last_response_uuid, _last_jsonl_path, _jsonl_locked
+    _jsonl_locked = False
     jsonl_path = _get_latest_jsonl(_claude_cwd)
     if jsonl_path:
         # Use allow_pending=True so we bookmark past any existing assistant
@@ -387,9 +389,9 @@ async def send_claude_response(text: str):
 
 
 # --- Permission response helpers ---
-def _write_perm_response(decision: str):
+def _write_perm_response(uid: str, decision: str):
     """Write a permission response file for the hook to pick up (atomic)."""
-    resp_path = PERM_RESP_PATTERN.format(session_id=_telebot_session_id)
+    resp_path = PERM_RESP_PATTERN.format(session_id=_telebot_session_id, uid=uid)
     dir_name = os.path.dirname(resp_path)
     fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
     try:
@@ -405,10 +407,11 @@ def _write_perm_response(decision: str):
 
 
 async def _deny_perm_and_wait():
-    """Deny the pending permission by writing a response file."""
-    global _perm_pending
-    _write_perm_response("deny")
-    _perm_pending = False
+    """Deny all pending permissions by writing response files."""
+    global _perm_queue
+    for item in _perm_queue:
+        _write_perm_response(item["uid"], "deny")
+    _perm_queue = []
     await asyncio.sleep(0.5)
 
 
@@ -437,10 +440,8 @@ _SHELL_NAMES = frozenset(("bash", "zsh", "fish", "sh", "dash", "tcsh", "ksh"))
 
 async def _claude_watcher():
     """Poll for permission requests, detect Claude exit, and extract responses."""
-    global _perm_pending, _perm_set_at, _claude_mode, _last_response_uuid, _last_jsonl_path
-    req_path = PERM_REQ_PATTERN.format(session_id=_telebot_session_id)
-    _last_jsonl_size = 0  # track JSONL growth for stale perm detection
-
+    global _perm_queue, _claude_mode, _last_response_uuid, _last_jsonl_path, _jsonl_locked
+    req_glob = PERM_REQ_GLOB.format(session_id=_telebot_session_id)
     # Grace period: skip exit detection for the first few seconds
     # so the shell→claude transition has time to happen
     started_at = time.time()
@@ -448,40 +449,48 @@ async def _claude_watcher():
 
     while _claude_mode:
         try:
-            # --- JSONL path lookup (used by both perm and response sections) ---
-            jsonl_path = _get_latest_jsonl(_claude_cwd)
+            # --- JSONL path lookup (locked after first switch to avoid
+            # picking up other Claude sessions' files) ---
+            if _jsonl_locked and _last_jsonl_path and os.path.exists(_last_jsonl_path):
+                jsonl_path = _last_jsonl_path
+            else:
+                jsonl_path = _get_latest_jsonl(_claude_cwd)
 
             # --- Permission request polling ---
-            if os.path.exists(req_path) and not _perm_pending:
+            req_files = sorted(globmod.glob(req_glob), key=os.path.getmtime)
+            for req_file in req_files:
                 try:
-                    with open(req_path) as f:
+                    with open(req_file) as f:
                         req = json.load(f)
                 except (json.JSONDecodeError, IOError):
-                    await asyncio.sleep(0.5)
                     continue
                 tool_name = req.get("tool_name", "unknown")
                 tool_input = req.get("tool_input", {})
+                uid = req.get("uid", "")
                 msg = _format_perm_request(tool_name, tool_input)
+                pending_count = len(_perm_queue) + 1
+                if pending_count > 1:
+                    msg = f"[{pending_count} pending] {msg}"
                 await app.bot.send_message(chat_id=_chat_id, text=msg)
                 try:
-                    os.remove(req_path)
+                    os.remove(req_file)
                 except FileNotFoundError:
                     pass
-                _perm_pending = True
-                _perm_set_at = time.time()
-                if jsonl_path:
-                    try:
-                        _last_jsonl_size = os.path.getsize(jsonl_path)
-                    except OSError:
-                        pass
+                _perm_queue.append({
+                    "uid": uid,
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                    "sent_at": time.time(),
+                })
 
             # --- JSONL response extraction (before exit check to avoid missing final response) ---
             # Skip while permission is pending to avoid interleaving Claude text
             # with the permission prompt
-            if jsonl_path and not _perm_pending:
+            if jsonl_path and not _perm_queue:
                 # New JSONL file = new Claude session; snapshot to skip
                 # any existing content (like the greeting)
                 if jsonl_path != _last_jsonl_path:
+                    _jsonl_locked = True
                     _, _last_response_uuid = _extract_last_response(
                         jsonl_path, None, allow_pending=True,
                     )
@@ -498,20 +507,13 @@ async def _claude_watcher():
                     await send_claude_response(text)
 
             # --- Stale permission detection ---
-            # If perm has been pending >5s and JSONL grew, the user answered
-            # from the terminal — auto-clear _perm_pending
-            if _perm_pending and (time.time() - _perm_set_at) > 5.0 and jsonl_path:
-                try:
-                    cur_size = os.path.getsize(jsonl_path)
-                except OSError:
-                    cur_size = _last_jsonl_size
-                if cur_size > _last_jsonl_size:
-                    _perm_pending = False
-
-            # Safety timeout: if _perm_pending has been True for >5 min,
-            # auto-clear it to prevent permanent lockout if something goes wrong
-            if _perm_pending and (time.time() - _perm_set_at) > 300.0:
-                _perm_pending = False
+            # Auto-deny items older than 5 min to avoid infinite hangs.
+            if _perm_queue and jsonl_path:
+                now = time.time()
+                # Safety timeout: auto-deny items older than 5 min
+                while _perm_queue and (now - _perm_queue[0]["sent_at"]) > 300.0:
+                    _write_perm_response(_perm_queue[0]["uid"], "deny")
+                    _perm_queue.pop(0)
 
             # --- Claude exit detection (after grace period) ---
             if (time.time() - started_at > exit_detect_after
@@ -528,7 +530,9 @@ async def _claude_watcher():
                             await send_claude_response(text)
                     _claude_mode = False
                     session.suppress_output = False
-                    _perm_pending = False
+                    for item in _perm_queue:
+                        _write_perm_response(item["uid"], "deny")
+                    _perm_queue = []
                     try:
                         await app.bot.send_message(
                             chat_id=_chat_id,
@@ -606,12 +610,12 @@ async def setup_reader():
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
-    global _chat_id, _claude_mode, _perm_pending
+    global _chat_id, _claude_mode, _perm_queue
     _chat_id = update.effective_chat.id
 
     _stop_claude_watcher()
     _claude_mode = False
-    _perm_pending = False
+    _perm_queue = []
 
     if session is not None:
         session.stop_reading()
@@ -625,11 +629,11 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_kill(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
-    global _claude_mode, _perm_pending
+    global _claude_mode, _perm_queue
 
     _stop_claude_watcher()
     _claude_mode = False
-    _perm_pending = False
+    _perm_queue = []
 
     if session is not None and session.alive:
         session.stop_reading()
@@ -704,14 +708,16 @@ async def cmd_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Exit Claude mode, back to terminal."""
     if not authorized(update):
         return
-    global _claude_mode, _perm_pending
-    if _perm_pending:
+    global _claude_mode, _perm_queue
+    if _perm_queue:
         await _deny_perm_and_wait()
+    _stop_claude_watcher()
     await _exit_claude()
     _claude_mode = False
-    _perm_pending = False
-    _stop_claude_watcher()
+    _perm_queue = []
     if session is not None:
+        await asyncio.sleep(1.0)       # let remaining exit output drain while still suppressed
+        session._output_buffer = ""    # discard any buffered exit noise
         session.suppress_output = False
     await update.message.reply_text("Back to terminal mode.")
 
@@ -720,10 +726,11 @@ async def cmd_claude_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Exit current Claude session and start a fresh one."""
     if not authorized(update):
         return
-    global _claude_mode, _perm_pending, _claude_cwd
-    if _perm_pending:
+    global _claude_mode, _perm_queue, _claude_cwd
+    if _perm_queue:
         await _deny_perm_and_wait()
     if _claude_mode:
+        _stop_claude_watcher()
         await _exit_claude()
         await asyncio.sleep(1.0)
     # Auto-start session if none exists
@@ -733,7 +740,7 @@ async def cmd_claude_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Start fresh Claude TUI
     _claude_cwd = _get_pty_cwd()
     _claude_mode = True
-    _perm_pending = False
+    _perm_queue = []
     session.suppress_output = True
     _snapshot_last_response_uuid()
     _start_claude_watcher()
@@ -746,7 +753,7 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show or set Claude permission mode (normal/auto/plan)."""
     if not authorized(update):
         return
-    global _claude_perm_mode, _perm_pending, _claude_cwd
+    global _claude_perm_mode, _perm_queue, _claude_cwd
 
     args = context.args
     if not args:
@@ -758,14 +765,15 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /mode [normal|auto|plan]")
         return
 
-    # If a permission is pending, deny it first
-    if _perm_pending:
+    # If permissions are pending, deny them first
+    if _perm_queue:
         await _deny_perm_and_wait()
 
     _claude_perm_mode = new_mode
 
     # If Claude TUI is running, restart it with new flags
     if _claude_mode:
+        _stop_claude_watcher()
         await _exit_claude()
         await asyncio.sleep(1.0)
         _claude_cwd = _get_pty_cwd()
@@ -810,7 +818,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
 
-    global _chat_id, _claude_mode, _perm_pending, _resume_pending, _resume_sessions, _claude_cwd
+    global _chat_id, _claude_mode, _perm_queue, _resume_pending, _resume_sessions, _claude_cwd
     _chat_id = update.effective_chat.id
 
     text = update.message.text
@@ -828,12 +836,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await setup_reader()
             # Exit current Claude if running
             if _claude_mode:
+                _stop_claude_watcher()
                 await _exit_claude()
                 await asyncio.sleep(1.0)
             # Enter Claude mode with --resume
             _claude_cwd = _get_pty_cwd()
             _claude_mode = True
-            _perm_pending = False
+            _perm_queue = []
             session.suppress_output = True
             _snapshot_last_response_uuid()
             _start_claude_watcher()
@@ -880,30 +889,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _start_claude_watcher()  # no-op if already running
         # ^C cancels active Claude process
         if text == "^C":
-            if _perm_pending:
+            if _perm_queue:
                 await _deny_perm_and_wait()
             if session is not None and session.alive:
                 session.send_signal_char("\x03")
                 await update.message.reply_text("Claude cancelled.")
             return
 
-        # Permission response (only when a permission is pending)
-        # Allow — write response file for the hook
-        if _perm_pending and text.lower() in ("y", "yes"):
-            _write_perm_response("allow")
-            _perm_pending = False
-            await update.message.reply_text("Allowed.")
+        # Permission response (only when permissions are pending)
+        # Allow — pop first item, write uid-specific response
+        if _perm_queue and text.lower() in ("y", "yes"):
+            item = _perm_queue.pop(0)
+            _write_perm_response(item["uid"], "allow")
+            remaining = len(_perm_queue)
+            if remaining:
+                await update.message.reply_text(f"Allowed. ({remaining} more pending)")
+            else:
+                await update.message.reply_text("Allowed.")
             return
 
-        # Deny — write response file for the hook
-        if _perm_pending and text.lower() in ("n", "no"):
-            _write_perm_response("deny")
-            _perm_pending = False
-            await update.message.reply_text("Denied.")
+        # Deny — pop first item, write uid-specific response
+        if _perm_queue and text.lower() in ("n", "no"):
+            item = _perm_queue.pop(0)
+            _write_perm_response(item["uid"], "deny")
+            remaining = len(_perm_queue)
+            if remaining:
+                await update.message.reply_text(f"Denied. ({remaining} more pending)")
+            else:
+                await update.message.reply_text("Denied.")
             return
 
-        # Any other message while permission pending — auto-deny and forward
-        if _perm_pending:
+        # Any other message while permission pending — auto-deny all and forward
+        if _perm_queue:
             await _deny_perm_and_wait()
             if session is not None and session.alive:
                 session.send_signal_char("\x03")
@@ -984,7 +1001,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
 
-    global _chat_id, _perm_pending
+    global _chat_id, _perm_queue
     _chat_id = update.effective_chat.id
 
     file = await context.bot.get_file(update.message.voice.file_id)
@@ -1011,7 +1028,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if _claude_mode:
         _start_claude_watcher()
-        if _perm_pending:
+        if _perm_queue:
             await _deny_perm_and_wait()
             if session is not None and session.alive:
                 session.send_signal_char("\x03")
@@ -1027,13 +1044,13 @@ async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_T
     """Forward unrecognized slash commands to Claude when in Claude mode."""
     if not authorized(update):
         return
-    global _chat_id, _perm_pending
+    global _chat_id, _perm_queue
     _chat_id = update.effective_chat.id
 
     if _claude_mode:
         _start_claude_watcher()  # no-op if already running
         text = update.message.text  # e.g. "/research_codebase the auth module"
-        if _perm_pending:
+        if _perm_queue:
             await _deny_perm_and_wait()
             if session is not None and session.alive:
                 session.send_signal_char("\x03")
@@ -1119,6 +1136,18 @@ def main():
     # Write PID file so the hook can check if we're alive
     with open(TELEBOT_PID_FILE, "w") as f:
         f.write(str(os.getpid()))
+
+    # Ensure tmux session is killed on exit (Ctrl+C, crash, etc.)
+    # post_shutdown only fires on clean exit, so atexit covers the rest.
+    def _atexit_cleanup():
+        if session is not None and session.alive:
+            session.kill()
+        try:
+            os.remove(TELEBOT_PID_FILE)
+        except OSError:
+            pass
+
+    atexit.register(_atexit_cleanup)
 
     # Run with polling (no webhooks, no open ports)
     sys.stderr.write(f"Starting bot... attach terminal: tmux attach -t {TMUX_SESSION_NAME}\n")
