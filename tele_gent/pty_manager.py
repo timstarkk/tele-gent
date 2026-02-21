@@ -19,7 +19,6 @@ _ANSI_RE = re.compile(
     r'|\x1bP[^\x1b]*\x1b\\'          # DCS
     r'|\x1b[^[\]P]'                   # Two-char ESC sequences
     r'|\x9b[0-9;?<>=! ]*[@-~]'       # 8-bit CSI
-    r'|\r(?!\n)'                      # Bare CR
     r'|\x07'                          # Bell
     r'|\x00'                          # Null
     r')'
@@ -34,24 +33,50 @@ def _cursor_forward_replacer(m):
     return ' ' * n
 
 
+def _apply_carriage_returns(text):
+    """Simulate terminal CR behavior: each \\r resets write position to column 0."""
+    lines = text.split('\n')
+    result = []
+    for line in lines:
+        if '\r' not in line:
+            result.append(line)
+            continue
+        segments = line.split('\r')
+        buf = segments[0]
+        for seg in segments[1:]:
+            if not seg:
+                continue
+            # Overwrite from column 0, keep trailing chars if new segment is shorter
+            if len(seg) >= len(buf):
+                buf = seg
+            else:
+                buf = seg + buf[len(seg):]
+        result.append(buf)
+    return '\n'.join(result)
+
+
 def clean_output(text):
     """Strip ANSI codes, replacing cursor-forward with spaces."""
     text = _CURSOR_FORWARD_RE.sub(_cursor_forward_replacer, text)
     text = _ANSI_RE.sub('', text)
+    text = _apply_carriage_returns(text)
     return text
 
 
 def _tmux(*args, check=True, capture=False):
     """Run a tmux command. Raises FileNotFoundError if tmux is missing."""
     cmd = [_TMUX_BIN] + list(args)
-    result = subprocess.run(
-        cmd,
-        capture_output=capture,
-        text=True if capture else False,
-        stdout=None if capture else subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=5,
-    )
+    if capture:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=5,
+        )
+    else:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
     if check and result.returncode != 0:
         raise subprocess.CalledProcessError(result.returncode, cmd)
     return result
@@ -67,6 +92,7 @@ class PTYSession:
         self._tail_task = None
         self._echo_suppress = None
         self._file_pos = 0
+        self._last_sent = ""
         self.suppress_output = False
 
     def spawn(self, cwd=None, env=None):
@@ -143,6 +169,25 @@ class PTYSession:
 
     def get_cwd(self):
         """Get the current working directory from tmux."""
+        # Primary: get the shell PID's actual CWD via lsof (macOS)
+        try:
+            pid_result = _tmux(
+                "display-message", "-t", TMUX_SESSION_NAME,
+                "-p", "#{pane_pid}",
+                capture=True,
+            )
+            pid = pid_result.stdout.strip()
+            if pid:
+                lsof = subprocess.run(
+                    ["lsof", "-a", "-d", "cwd", "-p", pid, "-Fn"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                for line in lsof.stdout.splitlines():
+                    if line.startswith("n/"):
+                        return line[1:]
+        except Exception:
+            pass
+        # Fallback: tmux's built-in CWD tracking
         try:
             result = _tmux(
                 "display-message", "-t", TMUX_SESSION_NAME,
@@ -238,7 +283,15 @@ class PTYSession:
                     idx = output.find(cmd)
                     if idx != -1:
                         output = output[idx + len(cmd):]
+                # Skip output that's just a shell prompt (no meaningful content)
+                stripped = output.strip()
+                if not stripped or all(c in '~$#>%! ' for c in stripped):
+                    continue
                 if self._on_output and output.strip() and not self.suppress_output:
+                    # Skip consecutive identical outputs (e.g. prompt redrawn on startup)
+                    if output.strip() == self._last_sent:
+                        continue
+                    self._last_sent = output.strip()
                     await self._on_output(output)
 
     def stop_reading(self):

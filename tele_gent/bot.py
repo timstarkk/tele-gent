@@ -70,6 +70,7 @@ _perm_set_at = 0.0
 _claude_watch_task = None
 _last_response_uuid = None
 _last_jsonl_path = None
+_claude_cwd = None  # Pinned CWD at claude-mode entry (before Claude chdir's)
 
 # Resume flow state
 _resume_pending = False
@@ -195,9 +196,9 @@ def _get_pty_cwd() -> str:
 
 
 # --- JSONL response extraction ---
-def _get_latest_jsonl() -> str | None:
+def _get_latest_jsonl(cwd_override=None) -> str | None:
     """Find the most recently modified .jsonl in the Claude project dir for current CWD."""
-    cwd = _get_pty_cwd()
+    cwd = cwd_override or _get_pty_cwd()
     project_slug = cwd.replace("/", "-")
     project_dir = os.path.join(CLAUDE_PROJECTS_DIR, project_slug)
     if not os.path.isdir(project_dir):
@@ -276,7 +277,7 @@ def _extract_last_response(jsonl_path: str, after_uuid: str | None,
 def _snapshot_last_response_uuid():
     """Snapshot the current last response UUID so we only send NEW responses."""
     global _last_response_uuid, _last_jsonl_path
-    jsonl_path = _get_latest_jsonl()
+    jsonl_path = _get_latest_jsonl(_claude_cwd)
     if jsonl_path:
         # Use allow_pending=True so we bookmark past any existing assistant
         # messages at EOF (like Claude's greeting), avoiding re-sending them
@@ -448,7 +449,7 @@ async def _claude_watcher():
     while _claude_mode:
         try:
             # --- JSONL path lookup (used by both perm and response sections) ---
-            jsonl_path = _get_latest_jsonl()
+            jsonl_path = _get_latest_jsonl(_claude_cwd)
 
             # --- Permission request polling ---
             if os.path.exists(req_path) and not _perm_pending:
@@ -506,6 +507,11 @@ async def _claude_watcher():
                     cur_size = _last_jsonl_size
                 if cur_size > _last_jsonl_size:
                     _perm_pending = False
+
+            # Safety timeout: if _perm_pending has been True for >5 min,
+            # auto-clear it to prevent permanent lockout if something goes wrong
+            if _perm_pending and (time.time() - _perm_set_at) > 300.0:
+                _perm_pending = False
 
             # --- Claude exit detection (after grace period) ---
             if (time.time() - started_at > exit_detect_after
@@ -714,7 +720,7 @@ async def cmd_claude_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Exit current Claude session and start a fresh one."""
     if not authorized(update):
         return
-    global _claude_mode, _perm_pending
+    global _claude_mode, _perm_pending, _claude_cwd
     if _perm_pending:
         await _deny_perm_and_wait()
     if _claude_mode:
@@ -725,6 +731,7 @@ async def cmd_claude_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
         start_session()
         await setup_reader()
     # Start fresh Claude TUI
+    _claude_cwd = _get_pty_cwd()
     _claude_mode = True
     _perm_pending = False
     session.suppress_output = True
@@ -739,7 +746,7 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show or set Claude permission mode (normal/auto/plan)."""
     if not authorized(update):
         return
-    global _claude_perm_mode, _perm_pending
+    global _claude_perm_mode, _perm_pending, _claude_cwd
 
     args = context.args
     if not args:
@@ -761,6 +768,7 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _claude_mode:
         await _exit_claude()
         await asyncio.sleep(1.0)
+        _claude_cwd = _get_pty_cwd()
         if session is not None and session.alive:
             session.send_line(_build_claude_start_cmd())
             asyncio.ensure_future(_dismiss_trust_prompt())
@@ -802,7 +810,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
 
-    global _chat_id, _claude_mode, _perm_pending, _resume_pending, _resume_sessions
+    global _chat_id, _claude_mode, _perm_pending, _resume_pending, _resume_sessions, _claude_cwd
     _chat_id = update.effective_chat.id
 
     text = update.message.text
@@ -823,6 +831,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _exit_claude()
                 await asyncio.sleep(1.0)
             # Enter Claude mode with --resume
+            _claude_cwd = _get_pty_cwd()
             _claude_mode = True
             _perm_pending = False
             session.suppress_output = True
@@ -845,11 +854,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _resume_sessions = []
 
     # --- Claude trigger: "claude" or "claude <prompt>" ---
-    if text == "claude" or text.startswith("claude "):
+    text_lower = text.lower()
+    if text_lower == "claude" or text_lower.startswith("claude "):
         # Auto-start session if none exists
         if session is None or not session.alive:
             start_session()
             await setup_reader()
+        _claude_cwd = _get_pty_cwd()
         _claude_mode = True
         session.suppress_output = True
         _snapshot_last_response_uuid()
