@@ -8,6 +8,7 @@ request file and polls for a response file from the bot. When not set
 import json
 import os
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime
@@ -35,15 +36,24 @@ tmpdir = os.environ.get("TMPDIR", "/tmp")
 req_path = os.path.join(tmpdir, f"telebot_perm_req_{session_id}_{uid}.json")
 resp_path = os.path.join(tmpdir, f"telebot_perm_resp_{session_id}_{uid}.json")
 
-# Write request for bot to pick up
+# Write request for bot to pick up (atomic: write to tmp, then rename)
 request = {
     "uid": uid,
     "tool_name": input_data.get("tool_name", "unknown"),
     "tool_input": input_data.get("tool_input", {}),
     "ts": int(time.time()),
 }
-with open(req_path, "w") as f:
-    json.dump(request, f)
+fd, tmp_path = tempfile.mkstemp(dir=tmpdir, suffix=".tmp")
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(request, f)
+    os.rename(tmp_path, req_path)
+except Exception:
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    raise
 _log("req written")
 
 # Resolve bot PID for liveness checks

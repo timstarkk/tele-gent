@@ -4,6 +4,7 @@ import glob as globmod
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -457,8 +458,9 @@ async def _claude_watcher():
                 jsonl_path = _get_latest_jsonl(_claude_cwd)
 
             # --- Permission request polling ---
+            MAX_PERM_QUEUE = 20
             req_files = sorted(globmod.glob(req_glob), key=os.path.getmtime)
-            for req_file in req_files:
+            for req_file in req_files[:MAX_PERM_QUEUE - len(_perm_queue)]:
                 try:
                     with open(req_file) as f:
                         req = json.load(f)
@@ -467,6 +469,8 @@ async def _claude_watcher():
                 tool_name = req.get("tool_name", "unknown")
                 tool_input = req.get("tool_input", {})
                 uid = req.get("uid", "")
+                if not re.fullmatch(r'[0-9a-f]{1,16}', uid):
+                    continue
                 msg = _format_perm_request(tool_name, tool_input)
                 pending_count = len(_perm_queue) + 1
                 if pending_count > 1:
