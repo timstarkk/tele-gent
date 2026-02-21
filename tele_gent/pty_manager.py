@@ -213,6 +213,15 @@ class PTYSession:
         except Exception:
             return ""
 
+    def capture_pane(self) -> str:
+        """Return the visible text content of the tmux pane."""
+        try:
+            result = _tmux("capture-pane", "-t", TMUX_SESSION_NAME, "-p",
+                           capture=True, check=False)
+            return result.stdout if result.returncode == 0 else ""
+        except Exception:
+            return ""
+
     def kill(self):
         _tmux("kill-session", "-t", TMUX_SESSION_NAME, check=False)
         self.alive = False

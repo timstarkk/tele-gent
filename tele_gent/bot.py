@@ -24,7 +24,6 @@ from tele_gent.config import (
     CLAUDE_BIN,
     PERM_REQ_GLOB,
     START_DIR,
-    TELEBOT_PID_FILE,
     TELEGRAM_MAX_LENGTH,
     TMUX_PIPE_FILE,
     TMUX_SESSION_NAME,
@@ -387,27 +386,32 @@ async def send_claude_response(text: str):
 
 
 # --- Permission response helpers ---
-def _send_perm_keystroke(decision: str):
+def _send_perm_keystroke(decision: str) -> bool:
     """Send a keystroke to Claude's native permission prompt in tmux.
 
-    The hook returns permissionDecision="ask", which makes Claude show a
-    numbered selector:  › 1. Yes  2. No  (Esc to cancel)
-    "Yes" is pre-selected, so Enter approves. Escape denies.
+    Returns True if the prompt was visible and keystroke sent, False if stale.
     """
+    if not _is_perm_prompt_visible():
+        return False
     if decision == "allow":
         _tmux("send-keys", "-t", TMUX_SESSION_NAME, "Enter", check=False)
     else:
         _tmux("send-keys", "-t", TMUX_SESSION_NAME, "Escape", check=False)
+    return True
 
 
 async def _deny_perm_and_wait():
-    """Deny all pending permissions by sending Escape keystrokes."""
+    """Deny all pending permissions by sending Escape keystrokes.
+
+    Stops early if no prompt is visible (already handled elsewhere).
+    Polls for the next prompt between items instead of using a fixed sleep.
+    """
     global _perm_queue
     for item in _perm_queue:
-        _send_perm_keystroke("deny")
-        await asyncio.sleep(0.3)  # Claude shows prompts sequentially
+        if not _send_perm_keystroke("deny"):
+            break  # No prompt visible — remaining items are stale
+        await _wait_for_perm_prompt(timeout=2.0)
     _perm_queue = []
-    await asyncio.sleep(0.5)
 
 
 # --- Permission request formatting ---
@@ -442,6 +446,25 @@ def _short_perm_desc(tool_name: str, tool_input: dict) -> str:
     else:
         return tool_name
 
+
+_PERM_PROMPT_RE = re.compile(r"1\.\s*Yes\s+2\.\s*No")
+
+
+def _is_perm_prompt_visible() -> bool:
+    """Check if Claude's permission prompt is currently visible in tmux."""
+    if session is None or not session.alive:
+        return False
+    return bool(_PERM_PROMPT_RE.search(session.capture_pane()))
+
+
+async def _wait_for_perm_prompt(timeout: float = 5.0) -> bool:
+    """Poll until a permission prompt appears or timeout expires."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _is_perm_prompt_visible():
+            return True
+        await asyncio.sleep(0.5)
+    return False
 
 
 # --- Claude watcher (permissions + exit detection + response extraction) ---
@@ -520,29 +543,39 @@ async def _claude_watcher():
                     await send_claude_response(text)
 
             # --- Stale permission detection ---
-            # If new JSONL output appeared while permissions are pending,
-            # the terminal user already responded — clear the queue.
-            if _perm_queue and jsonl_path:
+            # Two signals: (1) JSONL mtime advanced past the queue item,
+            # (2) queue item >3s old and no prompt visible in tmux.
+            if _perm_queue:
                 now = time.time()
-                # Check if Claude moved on (new JSONL activity means
-                # the terminal user responded to the native prompt)
-                try:
-                    jsonl_mtime = os.path.getmtime(jsonl_path)
-                except OSError:
-                    jsonl_mtime = 0
+                stale_reason = None
                 front_sent = _perm_queue[0]["sent_at"]
-                if jsonl_mtime > front_sent + 2.0:
-                    # Claude got a response from the terminal — clear queue
+
+                # Signal 1: JSONL activity after the prompt was queued
+                if jsonl_path:
+                    try:
+                        jsonl_mtime = os.path.getmtime(jsonl_path)
+                    except OSError:
+                        jsonl_mtime = 0
+                    if jsonl_mtime > front_sent + 2.0:
+                        stale_reason = "handled from terminal"
+
+                # Signal 2: prompt old enough and not visible in tmux
+                if not stale_reason and (now - front_sent) > 3.0:
+                    if not _is_perm_prompt_visible():
+                        stale_reason = "prompt no longer visible"
+
+                if stale_reason:
                     for item in _perm_queue:
                         desc = _short_perm_desc(item["tool_name"], item["tool_input"])
                         try:
                             await app.bot.send_message(
                                 chat_id=_chat_id,
-                                text=f"{desc}: handled from terminal",
+                                text=f"{desc}: {stale_reason}",
                             )
                         except Exception:
                             pass
                     _perm_queue = []
+
                 # Auto-deny items older than 60s to avoid infinite hangs
                 while _perm_queue and (now - _perm_queue[0]["sent_at"]) > 60.0:
                     _send_perm_keystroke("deny")
@@ -614,11 +647,6 @@ def _cleanup_old_perm_files():
                 os.remove(f)
             except OSError:
                 pass
-    # Clean up stale PID file
-    try:
-        os.remove(TELEBOT_PID_FILE)
-    except OSError:
-        pass
 
 
 # --- PTY lifecycle ---
@@ -631,7 +659,6 @@ def start_session():
     session = PTYSession()
     session.spawn(cwd=START_DIR, env={
         "TELEBOT_SESSION_ID": _telebot_session_id,
-        "TELEBOT_PID": str(os.getpid()),
     })
 
 
@@ -931,32 +958,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Permission response (only when permissions are pending)
-        # Allow — pop first item, send 'y' keystroke to Claude's native prompt
+        # Allow — pop first item, send Enter to Claude's native prompt
         if _perm_queue and text.lower() in ("y", "yes"):
             item = _perm_queue.pop(0)
-            _send_perm_keystroke("allow")
             desc = _short_perm_desc(item["tool_name"], item["tool_input"])
-            if _perm_queue:
-                next_item = _perm_queue[0]
-                next_desc = _short_perm_desc(next_item["tool_name"], next_item["tool_input"])
+            if not _send_perm_keystroke("allow"):
+                # Prompt not visible — already handled elsewhere
+                _perm_queue = []
                 await update.message.reply_text(
-                    f"Allowed: {desc}\n\nNext: {next_desc}\n({len(_perm_queue)} pending) y/n?"
+                    f"{desc}: already handled (prompt not visible)"
                 )
+                return
+            if _perm_queue:
+                # Wait for the next prompt to render before showing it
+                if await _wait_for_perm_prompt(3.0):
+                    next_item = _perm_queue[0]
+                    next_desc = _short_perm_desc(next_item["tool_name"], next_item["tool_input"])
+                    await update.message.reply_text(
+                        f"Allowed: {desc}\n\nNext: {next_desc}\n({len(_perm_queue)} pending) y/n?"
+                    )
+                else:
+                    # Claude consumed remaining prompts (auto-approved, etc.)
+                    _perm_queue = []
+                    await update.message.reply_text(f"Allowed: {desc}\n(remaining items cleared — no prompt visible)")
             else:
                 await update.message.reply_text(f"Allowed: {desc}")
             return
 
-        # Deny — pop first item, send Escape keystroke to Claude's native prompt
+        # Deny — pop first item, send Escape to Claude's native prompt
         if _perm_queue and text.lower() in ("n", "no"):
             item = _perm_queue.pop(0)
-            _send_perm_keystroke("deny")
             desc = _short_perm_desc(item["tool_name"], item["tool_input"])
-            if _perm_queue:
-                next_item = _perm_queue[0]
-                next_desc = _short_perm_desc(next_item["tool_name"], next_item["tool_input"])
+            if not _send_perm_keystroke("deny"):
+                _perm_queue = []
                 await update.message.reply_text(
-                    f"Denied: {desc}\n\nNext: {next_desc}\n({len(_perm_queue)} pending) y/n?"
+                    f"{desc}: already handled (prompt not visible)"
                 )
+                return
+            if _perm_queue:
+                if await _wait_for_perm_prompt(3.0):
+                    next_item = _perm_queue[0]
+                    next_desc = _short_perm_desc(next_item["tool_name"], next_item["tool_input"])
+                    await update.message.reply_text(
+                        f"Denied: {desc}\n\nNext: {next_desc}\n({len(_perm_queue)} pending) y/n?"
+                    )
+                else:
+                    _perm_queue = []
+                    await update.message.reply_text(f"Denied: {desc}\n(remaining items cleared — no prompt visible)")
             else:
                 await update.message.reply_text(f"Denied: {desc}")
             return
@@ -1175,19 +1223,11 @@ def main():
         MessageHandler(filters.VOICE, handle_voice)
     )
 
-    # Write PID file so the hook can check if we're alive
-    with open(TELEBOT_PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
-
     # Ensure tmux session is killed on exit (Ctrl+C, crash, etc.)
     # post_shutdown only fires on clean exit, so atexit covers the rest.
     def _atexit_cleanup():
         if session is not None and session.alive:
             session.kill()
-        try:
-            os.remove(TELEBOT_PID_FILE)
-        except OSError:
-            pass
 
     atexit.register(_atexit_cleanup)
 
