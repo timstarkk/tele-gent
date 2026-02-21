@@ -285,11 +285,13 @@ def _snapshot_last_response_uuid(pinned_jsonl=None):
     if jsonl_path:
         # Use allow_pending=True so we bookmark past any existing assistant
         # messages at EOF (like Claude's greeting), avoiding re-sending them
-        _, _last_response_uuid = _extract_last_response(jsonl_path, None, allow_pending=True)
+        last_text, _last_response_uuid = _extract_last_response(jsonl_path, None, allow_pending=True)
         _last_jsonl_path = jsonl_path
+        return last_text
     else:
         _last_response_uuid = None
         _last_jsonl_path = None
+        return None
 
 
 # --- Recent sessions listing for /resume ---
@@ -944,12 +946,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.suppress_output = True
             project_slug = _claude_cwd.replace("/", "-")
             expected_jsonl = os.path.join(CLAUDE_PROJECTS_DIR, project_slug, f"{session_id}.jsonl")
-            _snapshot_last_response_uuid(pinned_jsonl=expected_jsonl)
+            last_text = _snapshot_last_response_uuid(pinned_jsonl=expected_jsonl)
             _start_claude_watcher()
             cmd = _build_claude_start_cmd() + f" --resume {session_id}"
             session.send_line(cmd)
             asyncio.ensure_future(_dismiss_trust_prompt())
             await update.message.reply_text(f"Resuming session {idx}...")
+            if last_text:
+                await send_claude_response(f"*Last response:*\n\n{last_text}")
             return
         else:
             _resume_pending = False
@@ -1297,11 +1301,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         session.suppress_output = True
         project_slug = _claude_cwd.replace("/", "-")
         expected_jsonl = os.path.join(CLAUDE_PROJECTS_DIR, project_slug, f"{session_id}.jsonl")
-        _snapshot_last_response_uuid(pinned_jsonl=expected_jsonl)
+        last_text = _snapshot_last_response_uuid(pinned_jsonl=expected_jsonl)
         _start_claude_watcher()
         cmd = _build_claude_start_cmd() + f" --resume {session_id}"
         session.send_line(cmd)
         asyncio.ensure_future(_dismiss_trust_prompt())
+        if last_text:
+            await send_claude_response(f"*Last response:*\n\n{last_text}")
         return
 
     await query.answer("Unknown action.")
