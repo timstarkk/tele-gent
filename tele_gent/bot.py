@@ -273,11 +273,15 @@ def _extract_last_response(jsonl_path: str, after_uuid: str | None,
     return last_completed_text, last_completed_uuid
 
 
-def _snapshot_last_response_uuid():
+def _snapshot_last_response_uuid(pinned_jsonl=None):
     """Snapshot the current last response UUID so we only send NEW responses."""
     global _last_response_uuid, _last_jsonl_path, _jsonl_locked
-    _jsonl_locked = False
-    jsonl_path = _get_latest_jsonl(_claude_cwd)
+    if pinned_jsonl and os.path.exists(pinned_jsonl):
+        _jsonl_locked = True
+        jsonl_path = pinned_jsonl
+    else:
+        _jsonl_locked = False
+        jsonl_path = _get_latest_jsonl(_claude_cwd)
     if jsonl_path:
         # Use allow_pending=True so we bookmark past any existing assistant
         # messages at EOF (like Claude's greeting), avoiding re-sending them
@@ -322,13 +326,17 @@ def _list_recent_sessions(n=5):
                         continue
                     if msg.get("type") == "user":
                         inner = msg.get("message", {})
-                        for block in inner.get("content", []):
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                preview = block.get("text", "").strip()
-                                break
-                            elif isinstance(block, str):
-                                preview = block.strip()
-                                break
+                        content = inner.get("content", [])
+                        if isinstance(content, str):
+                            preview = content.strip()
+                        else:
+                            for block in content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    preview = block.get("text", "").strip()
+                                    break
+                                elif isinstance(block, str):
+                                    preview = block.strip()
+                                    break
                         if preview:
                             break
         except (IOError, OSError):
@@ -934,7 +942,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _claude_mode = True
             _perm_queue = []
             session.suppress_output = True
-            _snapshot_last_response_uuid()
+            project_slug = _claude_cwd.replace("/", "-")
+            expected_jsonl = os.path.join(CLAUDE_PROJECTS_DIR, project_slug, f"{session_id}.jsonl")
+            _snapshot_last_response_uuid(pinned_jsonl=expected_jsonl)
             _start_claude_watcher()
             cmd = _build_claude_start_cmd() + f" --resume {session_id}"
             session.send_line(cmd)
@@ -1285,7 +1295,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         _claude_mode = True
         _perm_queue = []
         session.suppress_output = True
-        _snapshot_last_response_uuid()
+        project_slug = _claude_cwd.replace("/", "-")
+        expected_jsonl = os.path.join(CLAUDE_PROJECTS_DIR, project_slug, f"{session_id}.jsonl")
+        _snapshot_last_response_uuid(pinned_jsonl=expected_jsonl)
         _start_claude_watcher()
         cmd = _build_claude_start_cmd() + f" --resume {session_id}"
         session.send_line(cmd)
