@@ -9,9 +9,10 @@ import sys
 import time
 import uuid
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -408,6 +409,7 @@ async def _deny_perm_and_wait():
     """
     global _perm_queue
     for item in _perm_queue:
+        await _remove_buttons(item.get("msg_id", 0))
         if not _send_perm_keystroke("deny"):
             break  # No prompt visible — remaining items are stale
         await _wait_for_perm_prompt(timeout=2.0)
@@ -429,7 +431,6 @@ def _format_perm_request(tool_name: str, tool_input: dict) -> str:
         if len(str(tool_input)) > 200:
             inp += "..."
         msg = f"Claude wants to use: {tool_name}\n{inp}"
-    msg += "\n\nReply y to allow, n to deny"
     return msg[:500]
 
 
@@ -445,6 +446,26 @@ def _short_perm_desc(tool_name: str, tool_input: dict) -> str:
         return f"{tool_name}: {path}"
     else:
         return tool_name
+
+
+def _perm_keyboard(uid: str) -> InlineKeyboardMarkup:
+    """Build an inline keyboard with Approve/Deny buttons for a permission request."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Approve", callback_data=f"perm_allow_{uid}"),
+            InlineKeyboardButton("Deny", callback_data=f"perm_deny_{uid}"),
+        ]
+    ])
+
+
+async def _remove_buttons(msg_id: int):
+    """Remove inline keyboard from a Telegram message. Silently ignores failures."""
+    try:
+        await app.bot.edit_message_reply_markup(
+            chat_id=_chat_id, message_id=msg_id, reply_markup=None,
+        )
+    except Exception:
+        pass  # Message may be too old or already edited
 
 
 _PERM_PROMPT_RE = re.compile(r"1\.\s*Yes\s+2\.\s*No")
@@ -507,7 +528,10 @@ async def _claude_watcher():
                 pending_count = len(_perm_queue) + 1
                 if pending_count > 1:
                     msg = f"[{pending_count} pending] {msg}"
-                await app.bot.send_message(chat_id=_chat_id, text=msg)
+                sent = await app.bot.send_message(
+                    chat_id=_chat_id, text=msg,
+                    reply_markup=_perm_keyboard(uid),
+                )
                 try:
                     os.remove(req_file)
                 except FileNotFoundError:
@@ -517,6 +541,7 @@ async def _claude_watcher():
                     "tool_name": tool_name,
                     "tool_input": tool_input,
                     "sent_at": time.time(),
+                    "msg_id": sent.message_id,
                 })
 
             # --- JSONL response extraction (before exit check to avoid missing final response) ---
@@ -567,6 +592,7 @@ async def _claude_watcher():
                 if stale_reason:
                     for item in _perm_queue:
                         desc = _short_perm_desc(item["tool_name"], item["tool_input"])
+                        await _remove_buttons(item.get("msg_id", 0))
                         try:
                             await app.bot.send_message(
                                 chat_id=_chat_id,
@@ -578,6 +604,7 @@ async def _claude_watcher():
 
                 # Auto-deny items older than 60s to avoid infinite hangs
                 while _perm_queue and (now - _perm_queue[0]["sent_at"]) > 60.0:
+                    await _remove_buttons(_perm_queue[0].get("msg_id", 0))
                     _send_perm_keystroke("deny")
                     _perm_queue.pop(0)
                     await asyncio.sleep(0.3)
@@ -598,6 +625,7 @@ async def _claude_watcher():
                     _claude_mode = False
                     session.suppress_output = False
                     for item in _perm_queue:
+                        await _remove_buttons(item.get("msg_id", 0))
                         _send_perm_keystroke("deny")
                     _perm_queue = []
                     try:
@@ -863,15 +891,16 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No recent sessions found.")
         return
 
-    lines = ["Recent sessions:"]
+    buttons = []
     _resume_sessions = []
     for i, (sid, preview, mtime) in enumerate(sessions, 1):
         ago = _format_time_ago(mtime)
-        lines.append(f"{i}. {preview} ({ago})")
+        label = f"{i}. {preview[:30]} ({ago})"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"resume_{i}")])
         _resume_sessions.append(sid)
-    lines.append("\nReply with a number to resume.")
+    keyboard = InlineKeyboardMarkup(buttons)
     _resume_pending = True
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("Recent sessions:", reply_markup=keyboard)
 
 
 # --- Text message handler ---
@@ -961,6 +990,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Allow — pop first item, send Enter to Claude's native prompt
         if _perm_queue and text.lower() in ("y", "yes"):
             item = _perm_queue.pop(0)
+            # Refresh timestamps so stale detection doesn't race
+            now = time.time()
+            for remaining in _perm_queue:
+                remaining["sent_at"] = now
             desc = _short_perm_desc(item["tool_name"], item["tool_input"])
             if not _send_perm_keystroke("allow"):
                 # Prompt not visible — already handled elsewhere
@@ -988,6 +1021,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Deny — pop first item, send Escape to Claude's native prompt
         if _perm_queue and text.lower() in ("n", "no"):
             item = _perm_queue.pop(0)
+            # Refresh timestamps so stale detection doesn't race
+            now = time.time()
+            for remaining in _perm_queue:
+                remaining["sent_at"] = now
             desc = _short_perm_desc(item["tool_name"], item["tool_input"])
             if not _send_perm_keystroke("deny"):
                 _perm_queue = []
@@ -1157,6 +1194,107 @@ async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("Unknown command. Send /start for help.")
 
 
+# --- Inline keyboard callback handler ---
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline keyboard button taps for permissions and resume."""
+    global _perm_queue, _resume_pending, _resume_sessions, _claude_mode, _claude_cwd
+    query = update.callback_query
+    if query.from_user.id != AUTHORIZED_USER_ID:
+        await query.answer("Unauthorized.")
+        return
+
+    data = query.data
+
+    # --- Permission buttons ---
+    if data.startswith("perm_allow_") or data.startswith("perm_deny_"):
+        action = "allow" if data.startswith("perm_allow_") else "deny"
+        uid = data.split("_", 2)[2]  # perm_allow_{uid} or perm_deny_{uid}
+
+        # Validate: must be front of queue with matching UID
+        if not _perm_queue:
+            await query.answer("Expired or already handled.")
+            await _remove_buttons(query.message.message_id)
+            return
+
+        if _perm_queue[0]["uid"] != uid:
+            # Check if it's anywhere in the queue (out-of-order tap)
+            if any(item["uid"] == uid for item in _perm_queue):
+                await query.answer("Handle the first prompt first.")
+            else:
+                await query.answer("Expired or already handled.")
+                await _remove_buttons(query.message.message_id)
+            return
+
+        item = _perm_queue.pop(0)
+        # Refresh timestamps so stale detection doesn't race
+        now = time.time()
+        for remaining in _perm_queue:
+            remaining["sent_at"] = now
+        desc = _short_perm_desc(item["tool_name"], item["tool_input"])
+
+        if not _send_perm_keystroke(action):
+            # Prompt not visible — already handled elsewhere
+            _perm_queue = []
+            await query.answer(f"{desc}: already handled")
+            await _remove_buttons(query.message.message_id)
+            return
+
+        label = "Allowed" if action == "allow" else "Denied"
+        await query.answer(f"{label}: {desc}"[:200])
+        await _remove_buttons(query.message.message_id)
+
+        # If more pending, wait for next tmux prompt to render
+        if _perm_queue:
+            if not await _wait_for_perm_prompt(3.0):
+                # Claude consumed remaining prompts
+                for stale_item in _perm_queue:
+                    await _remove_buttons(stale_item.get("msg_id", 0))
+                _perm_queue = []
+        return
+
+    # --- Resume buttons ---
+    if data.startswith("resume_"):
+        idx_str = data.split("_", 1)[1]
+        if not idx_str.isdigit():
+            await query.answer("Invalid selection.")
+            return
+        idx = int(idx_str)
+
+        if not _resume_pending or not (1 <= idx <= len(_resume_sessions)):
+            await query.answer("Expired or invalid.")
+            await _remove_buttons(query.message.message_id)
+            return
+
+        session_id = _resume_sessions[idx - 1]
+        _resume_pending = False
+        _resume_sessions = []
+        await _remove_buttons(query.message.message_id)
+        await query.answer(f"Resuming session {idx}...")
+
+        # Auto-start terminal session if needed
+        if session is None or not session.alive:
+            start_session()
+            await setup_reader()
+        # Exit current Claude if running
+        if _claude_mode:
+            _stop_claude_watcher()
+            await _exit_claude()
+            await asyncio.sleep(1.0)
+        # Enter Claude mode with --resume
+        _claude_cwd = _get_pty_cwd()
+        _claude_mode = True
+        _perm_queue = []
+        session.suppress_output = True
+        _snapshot_last_response_uuid()
+        _start_claude_watcher()
+        cmd = _build_claude_start_cmd() + f" --resume {session_id}"
+        session.send_line(cmd)
+        asyncio.ensure_future(_dismiss_trust_prompt())
+        return
+
+    await query.answer("Unknown action.")
+
+
 # --- App lifecycle ---
 async def post_init(application: Application):
     """Called after the application is initialized — send startup notification."""
@@ -1197,7 +1335,8 @@ def main():
     application = builder.post_init(post_init).post_shutdown(shutdown).build()
     app = application
 
-    # Register handlers — commands first, then catch-all text
+    # Register handlers — callback queries, commands, then catch-all text
+    application.add_handler(CallbackQueryHandler(handle_callback_query))
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("new", cmd_new))
     application.add_handler(CommandHandler("kill", cmd_kill))
