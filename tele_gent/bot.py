@@ -5,9 +5,7 @@ import json
 import logging
 import os
 import re
-import signal
 import sys
-import tempfile
 import time
 import uuid
 
@@ -25,7 +23,6 @@ from tele_gent.config import (
     BOT_TOKEN,
     CLAUDE_BIN,
     PERM_REQ_GLOB,
-    PERM_RESP_PATTERN,
     START_DIR,
     TELEBOT_PID_FILE,
     TELEGRAM_MAX_LENGTH,
@@ -390,28 +387,25 @@ async def send_claude_response(text: str):
 
 
 # --- Permission response helpers ---
-def _write_perm_response(uid: str, decision: str):
-    """Write a permission response file for the hook to pick up (atomic)."""
-    resp_path = PERM_RESP_PATTERN.format(session_id=_telebot_session_id, uid=uid)
-    dir_name = os.path.dirname(resp_path)
-    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump({"decision": decision}, f)
-        os.rename(tmp_path, resp_path)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+def _send_perm_keystroke(decision: str):
+    """Send a keystroke to Claude's native permission prompt in tmux.
+
+    The hook returns permissionDecision="ask", which makes Claude show a
+    numbered selector:  › 1. Yes  2. No  (Esc to cancel)
+    "Yes" is pre-selected, so Enter approves. Escape denies.
+    """
+    if decision == "allow":
+        _tmux("send-keys", "-t", TMUX_SESSION_NAME, "Enter", check=False)
+    else:
+        _tmux("send-keys", "-t", TMUX_SESSION_NAME, "Escape", check=False)
 
 
 async def _deny_perm_and_wait():
-    """Deny all pending permissions by writing response files."""
+    """Deny all pending permissions by sending Escape keystrokes."""
     global _perm_queue
     for item in _perm_queue:
-        _write_perm_response(item["uid"], "deny")
+        _send_perm_keystroke("deny")
+        await asyncio.sleep(0.3)  # Claude shows prompts sequentially
     _perm_queue = []
     await asyncio.sleep(0.5)
 
@@ -433,6 +427,21 @@ def _format_perm_request(tool_name: str, tool_input: dict) -> str:
         msg = f"Claude wants to use: {tool_name}\n{inp}"
     msg += "\n\nReply y to allow, n to deny"
     return msg[:500]
+
+
+def _short_perm_desc(tool_name: str, tool_input: dict) -> str:
+    """Return a short description like 'Bash: git diff' or 'Edit: src/foo.py'."""
+    if tool_name == "Bash":
+        cmd = str(tool_input.get("command", ""))
+        if len(cmd) > 60:
+            cmd = cmd[:57] + "..."
+        return f"Bash: {cmd}"
+    elif tool_name in ("Edit", "Write", "MultiEdit"):
+        path = tool_input.get("file_path", "unknown")
+        return f"{tool_name}: {path}"
+    else:
+        return tool_name
+
 
 
 # --- Claude watcher (permissions + exit detection + response extraction) ---
@@ -511,13 +520,34 @@ async def _claude_watcher():
                     await send_claude_response(text)
 
             # --- Stale permission detection ---
-            # Auto-deny items older than 5 min to avoid infinite hangs.
+            # If new JSONL output appeared while permissions are pending,
+            # the terminal user already responded — clear the queue.
             if _perm_queue and jsonl_path:
                 now = time.time()
-                # Safety timeout: auto-deny items older than 5 min
-                while _perm_queue and (now - _perm_queue[0]["sent_at"]) > 300.0:
-                    _write_perm_response(_perm_queue[0]["uid"], "deny")
+                # Check if Claude moved on (new JSONL activity means
+                # the terminal user responded to the native prompt)
+                try:
+                    jsonl_mtime = os.path.getmtime(jsonl_path)
+                except OSError:
+                    jsonl_mtime = 0
+                front_sent = _perm_queue[0]["sent_at"]
+                if jsonl_mtime > front_sent + 2.0:
+                    # Claude got a response from the terminal — clear queue
+                    for item in _perm_queue:
+                        desc = _short_perm_desc(item["tool_name"], item["tool_input"])
+                        try:
+                            await app.bot.send_message(
+                                chat_id=_chat_id,
+                                text=f"{desc}: handled from terminal",
+                            )
+                        except Exception:
+                            pass
+                    _perm_queue = []
+                # Auto-deny items older than 60s to avoid infinite hangs
+                while _perm_queue and (now - _perm_queue[0]["sent_at"]) > 60.0:
+                    _send_perm_keystroke("deny")
                     _perm_queue.pop(0)
+                    await asyncio.sleep(0.3)
 
             # --- Claude exit detection (after grace period) ---
             if (time.time() - started_at > exit_detect_after
@@ -535,7 +565,7 @@ async def _claude_watcher():
                     _claude_mode = False
                     session.suppress_output = False
                     for item in _perm_queue:
-                        _write_perm_response(item["uid"], "deny")
+                        _send_perm_keystroke("deny")
                     _perm_queue = []
                     try:
                         await app.bot.send_message(
@@ -578,7 +608,7 @@ def _cleanup_old_perm_files():
         return
     _perm_files_cleaned = True
     tmpdir = os.environ.get("TMPDIR", "/tmp")
-    for pattern in ("telebot_perm_req_*.json", "telebot_perm_resp_*.json"):
+    for pattern in ("telebot_perm_req_*.json",):
         for f in globmod.glob(os.path.join(tmpdir, pattern)):
             try:
                 os.remove(f)
@@ -901,26 +931,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Permission response (only when permissions are pending)
-        # Allow — pop first item, write uid-specific response
+        # Allow — pop first item, send 'y' keystroke to Claude's native prompt
         if _perm_queue and text.lower() in ("y", "yes"):
             item = _perm_queue.pop(0)
-            _write_perm_response(item["uid"], "allow")
-            remaining = len(_perm_queue)
-            if remaining:
-                await update.message.reply_text(f"Allowed. ({remaining} more pending)")
+            _send_perm_keystroke("allow")
+            desc = _short_perm_desc(item["tool_name"], item["tool_input"])
+            if _perm_queue:
+                next_item = _perm_queue[0]
+                next_desc = _short_perm_desc(next_item["tool_name"], next_item["tool_input"])
+                await update.message.reply_text(
+                    f"Allowed: {desc}\n\nNext: {next_desc}\n({len(_perm_queue)} pending) y/n?"
+                )
             else:
-                await update.message.reply_text("Allowed.")
+                await update.message.reply_text(f"Allowed: {desc}")
             return
 
-        # Deny — pop first item, write uid-specific response
+        # Deny — pop first item, send Escape keystroke to Claude's native prompt
         if _perm_queue and text.lower() in ("n", "no"):
             item = _perm_queue.pop(0)
-            _write_perm_response(item["uid"], "deny")
-            remaining = len(_perm_queue)
-            if remaining:
-                await update.message.reply_text(f"Denied. ({remaining} more pending)")
+            _send_perm_keystroke("deny")
+            desc = _short_perm_desc(item["tool_name"], item["tool_input"])
+            if _perm_queue:
+                next_item = _perm_queue[0]
+                next_desc = _short_perm_desc(next_item["tool_name"], next_item["tool_input"])
+                await update.message.reply_text(
+                    f"Denied: {desc}\n\nNext: {next_desc}\n({len(_perm_queue)} pending) y/n?"
+                )
             else:
-                await update.message.reply_text("Denied.")
+                await update.message.reply_text(f"Denied: {desc}")
             return
 
         # Any other message while permission pending — auto-deny all and forward

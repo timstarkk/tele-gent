@@ -38,7 +38,6 @@ CLAUDE_BIN = "claude"
 CLAUDE_FLUSH_INTERVAL = 2.0
 TMPDIR = os.environ.get("TMPDIR", "/tmp")
 PERM_REQ_PATTERN = os.path.join(TMPDIR, "telebot_perm_req_{session_id}_{uid}.json")
-PERM_RESP_PATTERN = os.path.join(TMPDIR, "telebot_perm_resp_{session_id}_{uid}.json")
 PERM_REQ_GLOB = os.path.join(TMPDIR, "telebot_perm_req_{session_id}_*.json")
 TELEBOT_PID_FILE = os.path.join(TMPDIR, "telebot_pid.txt")
 
