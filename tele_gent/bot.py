@@ -478,7 +478,7 @@ async def _remove_buttons(msg_id: int):
         pass  # Message may be too old or already edited
 
 
-_PERM_PROMPT_RE = re.compile(r"1\.\s*Yes\s+2\.\s*No")
+_PERM_PROMPT_RE = re.compile(r"Esc to cancel")
 
 
 def _is_perm_prompt_visible() -> bool:
