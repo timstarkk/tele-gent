@@ -43,12 +43,14 @@ except Exception:
         pass
     raise
 
-# Return "ask" — Claude Code will show its native permission prompt in tmux.
-# The bot can respond by sending keystrokes (y / Escape) to the tmux pane.
+# AskUserQuestion: allow the tool so the interactive prompt renders in tmux.
+# Other tools: ask — Claude shows its native permission prompt in tmux,
+# and the bot can respond by sending keystrokes (Enter / Escape) to the pane.
+decision = "allow" if input_data.get("tool_name") == "AskUserQuestion" else "ask"
 print(json.dumps({
     "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
-        "permissionDecision": "ask"
+        "permissionDecision": decision
     }
 }))
 sys.exit(0)

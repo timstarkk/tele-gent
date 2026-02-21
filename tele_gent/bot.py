@@ -65,6 +65,7 @@ _claude_mode = False
 _claude_perm_mode = "normal"  # "normal", "auto", or "plan"
 _telebot_session_id = uuid.uuid4().hex[:12]
 _perm_queue: list[dict] = []  # each: {"uid", "tool_name", "tool_input", "sent_at"}
+_askq_pending: dict | None = None  # {"uid", "questions", "msg_ids", "header_msg_id", "sent_at"}
 _claude_watch_task = None
 _last_response_uuid = None
 _last_jsonl_path = None
@@ -478,6 +479,42 @@ async def _remove_buttons(msg_id: int):
         pass  # Message may be too old or already edited
 
 
+async def _clear_askq(send_escape: bool = True):
+    """Cancel a pending AskUserQuestion — remove buttons, optionally dismiss prompt."""
+    global _askq_pending
+    if _askq_pending is None:
+        return
+    for msg_id in _askq_pending.get("msg_ids", []):
+        await _remove_buttons(msg_id)
+    if send_escape:
+        _tmux("send-keys", "-t", TMUX_SESSION_NAME, "Escape", check=False)
+    _askq_pending = None
+
+
+async def _send_askq_messages(uid: str, question: dict, q_index: int, total: int) -> tuple[int, list[int]]:
+    """Send AskUserQuestion header + options to Telegram. Returns (header_msg_id, option_msg_ids)."""
+    q_label = f"({q_index + 1}/{total}) " if total > 1 else ""
+    header = await app.bot.send_message(
+        chat_id=_chat_id,
+        text=f"*Claude asks {q_label}:* {question.get('question', '')}",
+        parse_mode="Markdown",
+    )
+    msg_ids = []
+    for i, opt in enumerate(question.get("options", []), 1):
+        label = opt.get("label", f"Option {i}")
+        desc = opt.get("description", "")
+        text = f"*{i}. {label}*\n{desc}" if desc else f"*{i}. {label}*"
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Accept", callback_data=f"askq_{uid}_{i}")
+        ]])
+        sent = await app.bot.send_message(
+            chat_id=_chat_id, text=text,
+            reply_markup=keyboard, parse_mode="Markdown",
+        )
+        msg_ids.append(sent.message_id)
+    return header.message_id, msg_ids
+
+
 _PERM_PROMPT_RE = re.compile(r"Esc to cancel")
 
 
@@ -504,7 +541,7 @@ _SHELL_NAMES = frozenset(("bash", "zsh", "fish", "sh", "dash", "tcsh", "ksh"))
 
 async def _claude_watcher():
     """Poll for permission requests, detect Claude exit, and extract responses."""
-    global _perm_queue, _claude_mode, _last_response_uuid, _last_jsonl_path, _jsonl_locked
+    global _perm_queue, _claude_mode, _last_response_uuid, _last_jsonl_path, _jsonl_locked, _askq_pending
     req_glob = PERM_REQ_GLOB.format(session_id=_telebot_session_id)
     # Grace period: skip exit detection for the first few seconds
     # so the shell→claude transition has time to happen
@@ -534,6 +571,29 @@ async def _claude_watcher():
                 uid = req.get("uid", "")
                 if not re.fullmatch(r'[0-9a-f]{1,16}', uid):
                     continue
+                try:
+                    os.remove(req_file)
+                except FileNotFoundError:
+                    pass
+
+                # --- AskUserQuestion: show each option with an Accept button ---
+                if tool_name == "AskUserQuestion" and _askq_pending is None:
+                    questions = tool_input.get("questions", [])
+                    if questions:
+                        header_msg_id, msg_ids = await _send_askq_messages(
+                            uid, questions[0], 0, len(questions),
+                        )
+                        _askq_pending = {
+                            "uid": uid,
+                            "questions": questions,
+                            "msg_ids": msg_ids,
+                            "header_msg_id": header_msg_id,
+                            "current_q": 0,
+                            "sent_at": time.time(),
+                        }
+                    continue
+
+                # --- Normal permission request ---
                 msg = _format_perm_request(tool_name, tool_input)
                 pending_count = len(_perm_queue) + 1
                 if pending_count > 1:
@@ -542,10 +602,6 @@ async def _claude_watcher():
                     chat_id=_chat_id, text=msg,
                     reply_markup=_perm_keyboard(uid),
                 )
-                try:
-                    os.remove(req_file)
-                except FileNotFoundError:
-                    pass
                 _perm_queue.append({
                     "uid": uid,
                     "tool_name": tool_name,
@@ -555,9 +611,9 @@ async def _claude_watcher():
                 })
 
             # --- JSONL response extraction (before exit check to avoid missing final response) ---
-            # Skip while permission is pending to avoid interleaving Claude text
-            # with the permission prompt
-            if jsonl_path and not _perm_queue:
+            # Skip while permission or AskUserQuestion is pending to avoid
+            # interleaving Claude text with the interactive prompt
+            if jsonl_path and not _perm_queue and _askq_pending is None:
                 # New JSONL file = new Claude session; snapshot to skip
                 # any existing content (like the greeting)
                 if jsonl_path != _last_jsonl_path:
@@ -619,6 +675,29 @@ async def _claude_watcher():
                     _perm_queue.pop(0)
                     await asyncio.sleep(0.3)
 
+            # --- Stale AskUserQuestion detection ---
+            if _askq_pending:
+                now = time.time()
+                askq_sent = _askq_pending["sent_at"]
+                askq_stale = False
+
+                # JSONL activity after the prompt was queued = Claude moved on
+                if jsonl_path:
+                    try:
+                        jsonl_mtime = os.path.getmtime(jsonl_path)
+                    except OSError:
+                        jsonl_mtime = 0
+                    if jsonl_mtime > askq_sent + 2.0:
+                        askq_stale = True
+
+                # Prompt old enough and no longer visible
+                if not askq_stale and (now - askq_sent) > 3.0:
+                    if not _is_perm_prompt_visible():
+                        askq_stale = True
+
+                if askq_stale:
+                    await _clear_askq(send_escape=False)
+
             # --- Claude exit detection (after grace period) ---
             if (time.time() - started_at > exit_detect_after
                     and session is not None and session.alive):
@@ -638,6 +717,7 @@ async def _claude_watcher():
                         await _remove_buttons(item.get("msg_id", 0))
                         _send_perm_keystroke("deny")
                     _perm_queue = []
+                    await _clear_askq(send_escape=False)
                     try:
                         await app.bot.send_message(
                             chat_id=_chat_id,
@@ -918,7 +998,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
 
-    global _chat_id, _claude_mode, _perm_queue, _resume_pending, _resume_sessions, _claude_cwd
+    global _chat_id, _claude_mode, _perm_queue, _resume_pending, _resume_sessions, _claude_cwd, _askq_pending
     _chat_id = update.effective_chat.id
 
     text = update.message.text
@@ -991,6 +1071,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Claude mode handling ---
     if _claude_mode:
         _start_claude_watcher()  # no-op if already running
+        # Cancel pending AskUserQuestion on any user input
+        if _askq_pending:
+            await _clear_askq()
+            await asyncio.sleep(0.3)
         # ^C cancels active Claude process
         if text == "^C":
             if _perm_queue:
@@ -1210,14 +1294,73 @@ async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_T
 
 # --- Inline keyboard callback handler ---
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline keyboard button taps for permissions and resume."""
-    global _perm_queue, _resume_pending, _resume_sessions, _claude_mode, _claude_cwd
+    """Handle inline keyboard button taps for permissions, AskUserQuestion, and resume."""
+    global _perm_queue, _resume_pending, _resume_sessions, _claude_mode, _claude_cwd, _askq_pending
     query = update.callback_query
     if query.from_user.id != AUTHORIZED_USER_ID:
         await query.answer("Unauthorized.")
         return
 
     data = query.data
+
+    # --- AskUserQuestion buttons ---
+    if data.startswith("askq_"):
+        parts = data.split("_")  # ["askq", uid, option_idx]
+        if len(parts) != 3 or not parts[2].isdigit():
+            await query.answer("Invalid.")
+            return
+        uid, option_idx = parts[1], int(parts[2])
+
+        if _askq_pending is None or _askq_pending["uid"] != uid:
+            await query.answer("Expired or already handled.")
+            await _remove_buttons(query.message.message_id)
+            return
+
+        # Send the number key to tmux to select this option
+        _tmux("send-keys", "-t", TMUX_SESSION_NAME, str(option_idx), check=False)
+
+        current_q = _askq_pending["current_q"]
+        questions = _askq_pending["questions"]
+
+        # Get the label for confirmation
+        options = questions[current_q].get("options", [])
+        label = options[option_idx - 1]["label"] if option_idx <= len(options) else f"Option {option_idx}"
+
+        # Clean up current question's option messages (remove buttons)
+        for msg_id in _askq_pending["msg_ids"]:
+            await _remove_buttons(msg_id)
+
+        # Edit header to show selection
+        try:
+            q_text = questions[current_q].get("question", "")
+            await app.bot.edit_message_text(
+                chat_id=_chat_id,
+                message_id=_askq_pending["header_msg_id"],
+                text=f"Claude asked: {q_text}\n→ Selected: *{label}*",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
+        await query.answer(f"Selected: {label}")
+
+        # Advance to next question or clear
+        next_q = current_q + 1
+        if next_q < len(questions):
+            await asyncio.sleep(0.3)  # brief pause before next question
+            header_msg_id, msg_ids = await _send_askq_messages(
+                uid, questions[next_q], next_q, len(questions),
+            )
+            _askq_pending["current_q"] = next_q
+            _askq_pending["msg_ids"] = msg_ids
+            _askq_pending["header_msg_id"] = header_msg_id
+            _askq_pending["sent_at"] = time.time()
+        else:
+            # TUI auto-advances to Submit tab — send "1" to submit answers
+            await asyncio.sleep(0.3)
+            _tmux("send-keys", "-t", TMUX_SESSION_NAME, "1", check=False)
+            _askq_pending = None
+        return
 
     # --- Permission buttons ---
     if data.startswith("perm_allow_") or data.startswith("perm_deny_"):
